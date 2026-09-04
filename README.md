@@ -1,4 +1,4 @@
 # DatabricksPersonal
-Databricks Free Edition
+Databricks Free Edition to frim vs code. 
 
-Testing from VSCode
+9/4/2026 - Testing git commit push from VSCode
