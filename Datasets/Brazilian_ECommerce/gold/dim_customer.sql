@@ -1,0 +1,39 @@
+-- Databricks notebook source
+-- create or replace table brazilian_ecommerce.gold.dim_customer
+-- /*
+-- TBLPROPERTIES (
+--   'config.nk_column_names' = '',
+--   'config.cluster_by' = 'customer_id,geolocation_zip_code_prefix',
+--   'config.fact_type' = 1,
+--   'config.sk_column_nane' = 'customer_sk',
+--   'config.primary_key' = 'customer_sk',
+--   'config.foreign_key' = '',
+--   'config.unique_constraints' = '',
+--   'config.not_null_constraints' = '',
+--   'config.check_constraints' = ''
+-- )
+-- as
+-- */
+-- --with temp as (
+-- select 
+-- md5(concat_ws('|',c.customer_id,gl.geolocation_zip_code_prefix)) as customer_sk,  ---Primary Key
+--   c.customer_id,
+--   c.customer_unique_id,
+--   c.customer_zip_code_prefix,
+--   c.customer_city,
+--   c.customer_state,
+--   gl.geolocation_zip_code_prefix,
+--   gl.geolocation_lat,
+--   gl.geolocation_lng,
+--   gl.geolocation_city,
+--   gl.geolocation_state
+-- from brazilian_ecommerce.silver. c
+-- inner join brazilian_ecommerce.silver.v_mst_geolocation gl
+-- on c.customer_zip_code_prefix = gl.geolocation_zip_code_prefix) 
+
+-- /*
+-- select customer_id,geolocation_zip_code_prefix,count(*)as count from temp
+-- where customer_id is null
+-- group by all
+-- having count(*) > 1;
+-- */
