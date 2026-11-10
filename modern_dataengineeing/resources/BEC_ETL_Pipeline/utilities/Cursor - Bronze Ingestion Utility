@@ -1,0 +1,869 @@
+"""Metadata-driven Bronze factory for Databricks Lakeflow / DLT pipelines.
+
+Builds Unity Catalog bronze tables from CDC raw sources:
+
+    ``{source_catalog}.{source_schema}.{source_table}``
+        → internal AUTO CDC streaming table ``{table_name}__cdc``
+        → published bronze table ``{target_catalog}.{target_schema}.{table_name}``
+
+Defaults: ``mde_dev.bec_raw`` → ``mde_dev.bronze``.
+
+Call ``generate_bronze_table(config)`` at pipeline **graph construction**
+time (module import), not inside a ``@dlt.table`` body. Each config gets
+uniquely named nested readers so a metadata loop cannot collide.
+
+Native AUTO CDC / SCD2 columns (``__START_AT``, ``__END_AT``, and older
+``__IS_CURRENT`` / ``__IS_DELETED``) are **not** the consumer contract.
+The published table always exposes:
+
+    * ``dl_iscurrent``     BOOLEAN
+    * ``dl_isdeleted``     BOOLEAN
+    * ``dl_starttimeutc``  TIMESTAMP
+    * ``dl_endtimeutc``    TIMESTAMP
+
+Current Databricks Python API is ``pyspark.pipelines.create_auto_cdc_flow``
+(same signature as legacy ``dlt.apply_changes``). This module prefers the
+Lakeflow name and falls back to ``dlt.apply_changes`` on older runtimes.
+There is no ``track_history=True`` flag; SCD2 is ``stored_as_scd_type=2``
+plus optional ``track_history_column_list`` / ``track_history_except_column_list``.
+"""
+
+from __future__ import annotations
+
+import inspect
+import logging
+import re
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Union
+
+try:
+    from typing import TypedDict
+except ImportError:  # pragma: no cover
+    from typing_extensions import TypedDict  # type: ignore
+
+
+logger = logging.getLogger("hda.bronze_dlt")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+
+DEFAULT_SOURCE_CATALOG = "mde_dev"
+DEFAULT_SOURCE_SCHEMA = "bec_raw"
+DEFAULT_TARGET_CATALOG = "mde_dev"
+DEFAULT_TARGET_SCHEMA = "bronze"
+
+# Common CDC delete tokens: SQL Server CT / DMS ("D"), verbose DELETE,
+# Databricks CDF ("delete"), SQL Server CDC __$operation = 2 (legacy feeds
+# sometimes emit 1). Override per table with delete_values.
+DEFAULT_DELETE_VALUES: tuple[str, ...] = ("D", "DELETE", "delete", "2")
+
+NATIVE_START_CANDIDATES = ("__START_AT", "__start_at")
+NATIVE_END_CANDIDATES = ("__END_AT", "__end_at")
+NATIVE_CURRENT_CANDIDATES = ("__IS_CURRENT", "__is_current")
+NATIVE_DELETED_CANDIDATES = ("__IS_DELETED", "__is_deleted", "__DELETED")
+
+DL_ISCURRENT = "dl_iscurrent"
+DL_ISDELETED = "dl_isdeleted"
+DL_START = "dl_starttimeutc"
+DL_END = "dl_endtimeutc"
+
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_REQUIRED_KEYS = ("table_name", "primary_keys", "sequence_column", "scd_type")
+
+
+class BronzeTableConfig(TypedDict, total=False):
+    """Metadata for one bronze AUTO CDC table.
+
+    Required keys: ``table_name``, ``primary_keys``, ``sequence_column``,
+    ``scd_type``. ``operation_column`` is required unless ``apply_as_deletes``
+    is supplied (string SQL, Column, or ``False`` to disable delete handling).
+    """
+
+    table_name: str
+    primary_keys: List[str]
+    sequence_column: Union[str, List[str]]
+    operation_column: str
+    scd_type: Union[int, str]
+    source_table_name: str
+    source_catalog: str
+    source_schema: str
+    target_catalog: str
+    target_schema: str
+    comment: str
+    cluster_by: List[str]
+    cluster_by_auto: bool
+    partition_cols: List[str]
+    table_properties: Dict[str, str]
+    column_list: List[str]
+    except_column_list: List[str]
+    apply_as_deletes: Any
+    apply_as_truncates: Any
+    delete_values: List[str]
+    ignore_null_updates: bool
+    ignore_null_updates_column_list: List[str]
+    ignore_null_updates_except_column_list: List[str]
+    columns_to_update: Any
+    track_history: bool
+    track_history_column_list: List[str]
+    track_history_except_column_list: List[str]
+    system_sequence_by: str
+    cdc_table_name: str
+    publish_cdc_table: bool
+    once: bool
+    expect_all: Dict[str, str]
+    expect_all_or_drop: Dict[str, str]
+    expect_all_or_fail: Dict[str, str]
+    spark_conf: Dict[str, str]
+    schema: Any
+    row_filter: str
+
+
+@dataclass
+class BronzeTableSpec:
+    """Resolved names registered on the pipeline graph for one table."""
+
+    table_name: str
+    scd_type: int
+    full_source: str
+    source_view: str
+    cdc_table: str
+    published_table: str
+    cdc_is_private: bool
+
+
+@dataclass
+class _ResolvedBronzeConfig:
+    table_name: str
+    source_table_name: str
+    primary_keys: List[str]
+    sequence_columns: List[str]
+    operation_column: Optional[str]
+    scd_type: int
+    source_catalog: str
+    source_schema: str
+    target_catalog: str
+    target_schema: str
+    comment: Optional[str] = None
+    cluster_by: Optional[List[str]] = None
+    cluster_by_auto: Optional[bool] = None
+    partition_cols: Optional[List[str]] = None
+    table_properties: Dict[str, str] = field(default_factory=dict)
+    column_list: Optional[List[str]] = None
+    except_column_list: Optional[List[str]] = None
+    apply_as_deletes: Any = None
+    apply_as_truncates: Any = None
+    delete_values: List[str] = field(default_factory=lambda: list(DEFAULT_DELETE_VALUES))
+    ignore_null_updates: Optional[bool] = None
+    ignore_null_updates_column_list: Optional[List[str]] = None
+    ignore_null_updates_except_column_list: Optional[List[str]] = None
+    columns_to_update: Any = None
+    track_history_column_list: Optional[List[str]] = None
+    track_history_except_column_list: Optional[List[str]] = None
+    system_sequence_by: Optional[str] = None
+    cdc_table_name: str = ""
+    publish_cdc_table: bool = False
+    once: bool = False
+    expect_all: Optional[Dict[str, str]] = None
+    expect_all_or_drop: Optional[Dict[str, str]] = None
+    expect_all_or_fail: Optional[Dict[str, str]] = None
+    spark_conf: Optional[Dict[str, str]] = None
+    schema: Any = None
+    row_filter: Optional[str] = None
+
+    @property
+    def sequence_column(self) -> str:
+        return self.sequence_columns[0]
+
+    @property
+    def full_source(self) -> str:
+        return f"{self.source_catalog}.{self.source_schema}.{self.source_table_name}"
+
+    @property
+    def full_published(self) -> str:
+        return f"{self.target_catalog}.{self.target_schema}.{self.table_name}"
+
+    @property
+    def source_view_name(self) -> str:
+        return f"{self.table_name}__src"
+
+    @property
+    def cdc_short_name(self) -> str:
+        return self.cdc_table_name or f"{self.table_name}__cdc"
+
+    @property
+    def cdc_target_name(self) -> str:
+        if self.publish_cdc_table:
+            return f"{self.target_catalog}.{self.target_schema}.{self.cdc_short_name}"
+        return self.cdc_short_name
+
+
+def generate_bronze_table(config: Mapping[str, Any] | BronzeTableConfig) -> BronzeTableSpec:
+    """Register one bronze AUTO CDC table plus a ``dl_*`` overlay on the DLT graph.
+
+    Parameters
+    ----------
+    config:
+        See ``BronzeTableConfig``. Required: ``table_name``, ``primary_keys``,
+        ``sequence_column``, ``scd_type``. Must be invoked at import / graph
+        definition time.
+
+    Returns
+    -------
+    BronzeTableSpec
+        Resolved source view, internal CDC table, and published bronze names.
+    """
+    cfg = normalize_bronze_config(config)
+    api = _pipelines_api()
+
+    source_view = cfg.source_view_name
+    cdc_name = cfg.cdc_target_name
+    published = cfg.full_published
+
+    _register_source_view(api, cfg, source_view)
+    _register_cdc_streaming_table(api, cfg, cdc_name)
+    _apply_cdc(api, cfg, source=source_view, target=cdc_name)
+    _register_published_overlay(api, cfg, cdc_name=cdc_name, published_name=published)
+
+    spec = BronzeTableSpec(
+        table_name=cfg.table_name,
+        scd_type=cfg.scd_type,
+        full_source=cfg.full_source,
+        source_view=source_view,
+        cdc_table=cdc_name,
+        published_table=published,
+        cdc_is_private=not cfg.publish_cdc_table,
+    )
+    logger.info(
+        "Registered bronze table %s (SCD%s) source=%s cdc=%s published=%s",
+        cfg.table_name,
+        cfg.scd_type,
+        cfg.full_source,
+        cdc_name,
+        published,
+    )
+    return spec
+
+
+def normalize_bronze_config(config: Mapping[str, Any]) -> _ResolvedBronzeConfig:
+    """Validate and fill defaults. Raises ``ValueError`` on invalid metadata."""
+    if not isinstance(config, Mapping):
+        raise ValueError("generate_bronze_table config must be a mapping/dict.")
+
+    missing = [key for key in _REQUIRED_KEYS if not config.get(key)]
+    if missing:
+        raise ValueError(f"Bronze table config missing required key(s): {missing}")
+
+    table_catalog, table_schema, table_name = _split_object_name(
+        str(config["table_name"]), field="table_name"
+    )
+    source_catalog = _ident(
+        config.get("source_catalog") or DEFAULT_SOURCE_CATALOG, "source_catalog"
+    )
+    source_schema = _ident(
+        config.get("source_schema") or DEFAULT_SOURCE_SCHEMA, "source_schema"
+    )
+    target_catalog = _ident(
+        config.get("target_catalog") or table_catalog or DEFAULT_TARGET_CATALOG,
+        "target_catalog",
+    )
+    target_schema = _ident(
+        config.get("target_schema") or table_schema or DEFAULT_TARGET_SCHEMA,
+        "target_schema",
+    )
+    if table_catalog and table_catalog != target_catalog:
+        raise ValueError(
+            f"table_name catalog {table_catalog!r} conflicts with "
+            f"target_catalog {target_catalog!r}."
+        )
+    if table_schema and table_schema != target_schema:
+        raise ValueError(
+            f"table_name schema {table_schema!r} conflicts with "
+            f"target_schema {target_schema!r}."
+        )
+
+    source_table_name = _ident(
+        str(config.get("source_table_name") or table_name), "source_table_name"
+    )
+    primary_keys = _ident_list(config.get("primary_keys"), "primary_keys")
+    if not primary_keys:
+        raise ValueError("primary_keys must be a non-empty list of column names.")
+
+    sequence_columns = _coerce_sequence_columns(config.get("sequence_column"))
+    scd_type = _normalize_scd_type(config.get("scd_type"), config.get("track_history"))
+
+    apply_as_deletes = config.get("apply_as_deletes", None)
+    operation_column_raw = config.get("operation_column")
+    if apply_as_deletes is False:
+        operation_column = (
+            _ident(str(operation_column_raw), "operation_column")
+            if operation_column_raw
+            else None
+        )
+        resolved_deletes: Any = None
+    elif apply_as_deletes not in (None, ""):
+        operation_column = (
+            _ident(str(operation_column_raw), "operation_column")
+            if operation_column_raw
+            else None
+        )
+        resolved_deletes = apply_as_deletes
+    else:
+        if not operation_column_raw:
+            raise ValueError(
+                "operation_column is required unless apply_as_deletes is provided "
+                "(or set apply_as_deletes=False to skip AUTO CDC deletes)."
+            )
+        operation_column = _ident(str(operation_column_raw), "operation_column")
+        delete_values = _string_list(
+            config.get("delete_values") or DEFAULT_DELETE_VALUES, "delete_values"
+        )
+        resolved_deletes = _default_delete_sql(operation_column, delete_values)
+
+    column_list = _optional_ident_list(config.get("column_list"), "column_list")
+    except_column_list = _default_except_columns(
+        config.get("except_column_list"), operation_column
+    )
+    if column_list and except_column_list:
+        raise ValueError("Specify only one of column_list or except_column_list.")
+
+    track_cols = _optional_ident_list(
+        config.get("track_history_column_list"), "track_history_column_list"
+    )
+    track_except = _optional_ident_list(
+        config.get("track_history_except_column_list"),
+        "track_history_except_column_list",
+    )
+    if track_cols and track_except:
+        raise ValueError(
+            "Specify only one of track_history_column_list or "
+            "track_history_except_column_list."
+        )
+    if scd_type != 2 and (track_cols or track_except):
+        raise ValueError(
+            "track_history_column_list / track_history_except_column_list "
+            "are only valid for SCD Type 2."
+        )
+
+    ignore_list = _optional_ident_list(
+        config.get("ignore_null_updates_column_list"),
+        "ignore_null_updates_column_list",
+    )
+    ignore_except = _optional_ident_list(
+        config.get("ignore_null_updates_except_column_list"),
+        "ignore_null_updates_except_column_list",
+    )
+    if ignore_list and ignore_except:
+        raise ValueError(
+            "Specify only one of ignore_null_updates_column_list or "
+            "ignore_null_updates_except_column_list."
+        )
+
+    apply_as_truncates = config.get("apply_as_truncates")
+    if apply_as_truncates and scd_type == 2:
+        raise ValueError("apply_as_truncates is supported only for SCD Type 1.")
+
+    cdc_override = config.get("cdc_table_name")
+    cdc_table_name = _ident(str(cdc_override), "cdc_table_name") if cdc_override else ""
+
+    comment = config.get("comment")
+    props = dict(config.get("table_properties") or {})
+    props.setdefault("quality", "bronze")
+    props.setdefault("pipelines.cdc.scdType", str(scd_type))
+
+    return _ResolvedBronzeConfig(
+        table_name=_ident(table_name, "table_name"),
+        source_table_name=source_table_name,
+        primary_keys=primary_keys,
+        sequence_columns=sequence_columns,
+        operation_column=operation_column,
+        scd_type=scd_type,
+        source_catalog=source_catalog,
+        source_schema=source_schema,
+        target_catalog=target_catalog,
+        target_schema=target_schema,
+        comment=str(comment) if comment else None,
+        cluster_by=_optional_ident_list(config.get("cluster_by"), "cluster_by"),
+        cluster_by_auto=_optional_bool(config.get("cluster_by_auto")),
+        partition_cols=_optional_ident_list(config.get("partition_cols"), "partition_cols"),
+        table_properties=props,
+        column_list=column_list,
+        except_column_list=except_column_list,
+        apply_as_deletes=resolved_deletes,
+        apply_as_truncates=apply_as_truncates or None,
+        delete_values=_string_list(
+            config.get("delete_values") or DEFAULT_DELETE_VALUES, "delete_values"
+        ),
+        ignore_null_updates=_optional_bool(config.get("ignore_null_updates")),
+        ignore_null_updates_column_list=ignore_list,
+        ignore_null_updates_except_column_list=ignore_except,
+        columns_to_update=config.get("columns_to_update"),
+        track_history_column_list=track_cols,
+        track_history_except_column_list=track_except,
+        system_sequence_by=(
+            _ident(str(config["system_sequence_by"]), "system_sequence_by")
+            if config.get("system_sequence_by")
+            else None
+        ),
+        cdc_table_name=cdc_table_name,
+        publish_cdc_table=bool(config.get("publish_cdc_table", False)),
+        once=bool(config.get("once", False)),
+        expect_all=config.get("expect_all") or None,
+        expect_all_or_drop=config.get("expect_all_or_drop") or None,
+        expect_all_or_fail=config.get("expect_all_or_fail") or None,
+        spark_conf=config.get("spark_conf") or None,
+        schema=config.get("schema"),
+        row_filter=config.get("row_filter") or None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Graph registration
+# ---------------------------------------------------------------------------
+
+
+def _register_source_view(api: Any, cfg: _ResolvedBronzeConfig, view_name: str) -> None:
+    full_source = cfg.full_source
+
+    def _source() -> Any:
+        spark = _active_spark()
+        logger.info("Streaming bronze source %s", full_source)
+        return spark.readStream.table(full_source)
+
+    _source.__name__ = _safe_ident(f"src_{cfg.table_name}")
+    _source.__qualname__ = _source.__name__
+    _source.__doc__ = f"Streaming CDC feed from {full_source}."
+
+    view_fn = _first_attr(api, "view")
+    _decorate(view_fn, _source, name=view_name, comment=f"CDC source view for {full_source}")
+
+
+def _register_cdc_streaming_table(api: Any, cfg: _ResolvedBronzeConfig, cdc_name: str) -> None:
+    create_fn = _first_attr(api, "create_streaming_table", "create_streaming_live_table")
+    comment = (
+        cfg.comment
+        or f"Internal AUTO CDC landing for {cfg.full_published}. Query the published "
+        f"table (dl_* columns), not this __cdc object."
+    )
+    kwargs: Dict[str, Any] = {
+        "name": cdc_name,
+        "comment": comment,
+        "table_properties": cfg.table_properties or None,
+        "partition_cols": cfg.partition_cols,
+        "cluster_by": cfg.cluster_by,
+        "cluster_by_auto": cfg.cluster_by_auto,
+        "schema": cfg.schema,
+        "expect_all": cfg.expect_all,
+        "expect_all_or_drop": cfg.expect_all_or_drop,
+        "expect_all_or_fail": cfg.expect_all_or_fail,
+        "spark_conf": cfg.spark_conf,
+        "row_filter": cfg.row_filter,
+        "private": not cfg.publish_cdc_table,
+    }
+    _call_supported(create_fn, **kwargs)
+
+
+def _apply_cdc(api: Any, cfg: _ResolvedBronzeConfig, *, source: str, target: str) -> None:
+    flow_fn = _first_attr(api, "create_auto_cdc_flow", "apply_changes")
+    sequence_by = _sequence_by_expr(cfg.sequence_columns)
+    kwargs: Dict[str, Any] = {
+        "target": target,
+        "source": source,
+        "keys": list(cfg.primary_keys),
+        "sequence_by": sequence_by,
+        "apply_as_deletes": cfg.apply_as_deletes,
+        "apply_as_truncates": cfg.apply_as_truncates,
+        "column_list": cfg.column_list,
+        "except_column_list": cfg.except_column_list,
+        "stored_as_scd_type": cfg.scd_type,
+        "track_history_column_list": cfg.track_history_column_list,
+        "track_history_except_column_list": cfg.track_history_except_column_list,
+        "ignore_null_updates": cfg.ignore_null_updates,
+        "ignore_null_updates_column_list": cfg.ignore_null_updates_column_list,
+        "ignore_null_updates_except_column_list": cfg.ignore_null_updates_except_column_list,
+        "columns_to_update": cfg.columns_to_update,
+        "system_sequence_by": cfg.system_sequence_by,
+        "name": f"cdc_{cfg.table_name}",
+        "once": cfg.once or None,
+    }
+    _call_supported(flow_fn, **kwargs)
+
+
+def _register_published_overlay(
+    api: Any,
+    cfg: _ResolvedBronzeConfig,
+    *,
+    cdc_name: str,
+    published_name: str,
+) -> None:
+    """Materialized live table with business columns + mapped ``dl_*`` names.
+
+    Uses ``read`` (batch snapshot of the CDC streaming table), not
+    ``read_stream``. Streaming the CDC table would follow its change feed
+    instead of exposing full SCD state. AUTO CDC already maintains the
+    landing table incrementally.
+    """
+
+    def _overlay() -> Any:
+        df = _read_pipeline_dataset(api, cdc_name)
+        return map_cdc_to_dl_columns(df, cfg)
+
+    _overlay.__name__ = _safe_ident(f"bronze_{cfg.table_name}")
+    _overlay.__qualname__ = _overlay.__name__
+    _overlay.__doc__ = (
+        f"Published bronze table for {cfg.full_source} with dl_* SCD columns."
+    )
+
+    comment = cfg.comment or (
+        f"Bronze {cfg.table_name} (SCD Type {cfg.scd_type}) from {cfg.full_source}. "
+        f"SCD window columns are dl_iscurrent, dl_isdeleted, dl_starttimeutc, "
+        f"dl_endtimeutc — do not query __START_AT / __END_AT."
+    )
+    table_kwargs: Dict[str, Any] = {
+        "name": published_name,
+        "comment": comment,
+        "table_properties": cfg.table_properties or None,
+        "cluster_by": cfg.cluster_by,
+        "cluster_by_auto": cfg.cluster_by_auto,
+        "partition_cols": cfg.partition_cols,
+        "spark_conf": cfg.spark_conf,
+    }
+
+    overlay_fn = None
+    for attr in ("materialized_view", "table"):
+        overlay_fn = getattr(api, attr, None)
+        if overlay_fn is not None:
+            break
+    if overlay_fn is None:
+        raise RuntimeError(
+            "Pipelines API has neither materialized_view nor table; "
+            "cannot publish the bronze overlay."
+        )
+    _decorate(overlay_fn, _overlay, **table_kwargs)
+
+
+# ---------------------------------------------------------------------------
+# dl_* mapping (version-tolerant)
+# ---------------------------------------------------------------------------
+
+
+def map_cdc_to_dl_columns(df: Any, cfg: _ResolvedBronzeConfig) -> Any:
+    """Project AUTO CDC output to business columns plus the four ``dl_*`` fields.
+
+    Mapping rules
+    -------------
+    ``dl_starttimeutc``
+        Timestamp-typed ``__START_AT`` if present; else timestamp-typed
+        ``sequence_column``; else UTC ingest time
+        (``to_utc_timestamp(current_timestamp(), current_timezone())``).
+        Numeric SCD sequence values are **not** treated as epoch seconds.
+    ``dl_endtimeutc``
+        Timestamp-typed ``__END_AT`` if present; else NULL for current rows.
+        For SCD1 deleted rows that still appear (deletes not applied as CDC
+        deletes), set to UTC ingest time.
+    ``dl_iscurrent``
+        Native ``__IS_CURRENT`` if present; else ``__END_AT IS NULL``.
+        SCD1 rows that remain after ``apply_as_deletes`` are current unless
+        flagged deleted.
+    ``dl_isdeleted``
+        Native ``__IS_DELETED`` if present; else ``operation_column`` in
+        ``delete_values`` if that column was kept; else SCD2 latest closed
+        version per key (``__END_AT IS NOT NULL`` on the newest row);
+        else ``false`` (SCD1 + ``apply_as_deletes`` drops the row).
+    """
+    from pyspark.sql import Window
+    from pyspark.sql import functions as F
+
+    cols = list(df.columns)
+    colset = {c.lower(): c for c in cols}
+
+    start_native = _first_present(colset, NATIVE_START_CANDIDATES)
+    end_native = _first_present(colset, NATIVE_END_CANDIDATES)
+    current_native = _first_present(colset, NATIVE_CURRENT_CANDIDATES)
+    deleted_native = _first_present(colset, NATIVE_DELETED_CANDIDATES)
+    op_kept = (
+        _first_present(colset, (cfg.operation_column,))
+        if cfg.operation_column
+        else None
+    )
+    seq_kept = _first_present(colset, (cfg.sequence_column,))
+
+    utc_now = F.expr("to_utc_timestamp(current_timestamp(), current_timezone())")
+    dtypes = {name: dtype.lower() for name, dtype in df.dtypes}
+
+    start_ts = _as_utc_timestamp(start_native, dtypes, utc_now)
+    if start_ts is None:
+        start_ts = _as_utc_timestamp(seq_kept, dtypes, utc_now)
+    if start_ts is None:
+        start_ts = utc_now
+
+    end_ts = _as_utc_timestamp(end_native, dtypes, None)
+    if end_ts is None:
+        end_ts = F.lit(None).cast("timestamp")
+
+    if current_native:
+        is_current = F.col(f"`{current_native}`").cast("boolean")
+    elif end_native:
+        is_current = F.col(f"`{end_native}`").isNull()
+    else:
+        is_current = F.lit(True)
+
+    if deleted_native:
+        is_deleted = F.col(f"`{deleted_native}`").cast("boolean")
+    elif op_kept:
+        is_deleted = _operation_is_delete(op_kept, cfg.delete_values)
+    elif cfg.scd_type == 2 and end_native:
+        order_col = start_native or seq_kept or end_native
+        window = Window.partitionBy(*[F.col(f"`{k}`") for k in cfg.primary_keys]).orderBy(
+            F.col(f"`{order_col}`").desc_nulls_last()
+        )
+        is_latest = F.row_number().over(window) == 1
+        is_deleted = is_latest & F.col(f"`{end_native}`").isNotNull()
+    else:
+        is_deleted = F.lit(False)
+
+    if cfg.scd_type == 1:
+        is_current = (~is_deleted) & is_current
+        end_ts = F.when(is_deleted, utc_now).otherwise(end_ts)
+
+    # Attach dl_* while native SCD / operation columns still exist (window
+    # expressions reference them), then drop internals from the published table.
+    mapped = (
+        df.withColumn(DL_ISCURRENT, is_current.cast("boolean"))
+        .withColumn(DL_ISDELETED, is_deleted.cast("boolean"))
+        .withColumn(DL_START, start_ts.cast("timestamp"))
+        .withColumn(DL_END, end_ts.cast("timestamp"))
+    )
+    internal = {
+        name
+        for name in (start_native, end_native, current_native, deleted_native, op_kept)
+        if name
+    }
+    published_cols = [c for c in mapped.columns if c not in internal]
+    return mapped.select(*[F.col(f"`{c}`") for c in published_cols])
+
+
+def _as_utc_timestamp(
+    column_name: Optional[str],
+    dtypes: Mapping[str, str],
+    fallback: Any,
+) -> Any:
+    """Use a column as TIMESTAMP only when it is already temporal or a datetime string.
+
+    Sequence numbers (long/int) are not cast to epoch timestamps.
+    """
+    from pyspark.sql import functions as F
+
+    if not column_name or column_name not in dtypes:
+        return fallback
+    dtype = dtypes[column_name]
+    col = F.col(f"`{column_name}`")
+    if dtype.startswith("timestamp") or dtype == "date":
+        return col.cast("timestamp")
+    if dtype in {"string", "varchar"}:
+        return F.to_timestamp(col)
+    return fallback
+
+
+def _operation_is_delete(operation_column: str, delete_values: Sequence[str]) -> Any:
+    from pyspark.sql import functions as F
+
+    normalized = [v.strip().upper() for v in delete_values]
+    return F.upper(F.col(f"`{operation_column}`").cast("string")).isin(normalized)
+
+
+# ---------------------------------------------------------------------------
+# Pipelines API helpers
+# ---------------------------------------------------------------------------
+
+
+def _pipelines_api() -> Any:
+    """Prefer ``pyspark.pipelines`` (Lakeflow); fall back to legacy ``dlt``."""
+    try:
+        from pyspark import pipelines as dp
+
+        return dp
+    except ImportError:
+        pass
+    try:
+        import dlt
+
+        return dlt
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "Neither pyspark.pipelines nor dlt is available. "
+            "Attach this file as a Databricks Lakeflow / DLT pipeline source."
+        ) from exc
+
+
+def _first_attr(api: Any, *names: str) -> Callable[..., Any]:
+    for name in names:
+        fn = getattr(api, name, None)
+        if callable(fn):
+            return fn
+    raise AttributeError(
+        f"Pipelines API {type(api).__name__} is missing any of: {', '.join(names)}"
+    )
+
+
+def _call_supported(fn: Callable[..., Any], **kwargs: Any) -> Any:
+    """Invoke ``fn``, dropping None values and kwargs the runtime signature rejects."""
+    cleaned = {key: value for key, value in kwargs.items() if value is not None}
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn(**cleaned)
+    if any(
+        param.kind == inspect.Parameter.VAR_KEYWORD
+        for param in signature.parameters.values()
+    ):
+        return fn(**cleaned)
+    allowed = set(signature.parameters)
+    return fn(**{key: value for key, value in cleaned.items() if key in allowed})
+
+
+def _decorate(decorator_fn: Callable[..., Any], impl: Callable[..., Any], **kwargs: Any) -> Any:
+    decorator = _call_supported(decorator_fn, **kwargs)
+    return decorator(impl)
+
+
+def _read_pipeline_dataset(api: Any, name: str) -> Any:
+    reader = getattr(api, "read", None)
+    if callable(reader):
+        return reader(name)
+    import dlt
+
+    return dlt.read(name)
+
+
+def _active_spark() -> Any:
+    from pyspark.sql import SparkSession
+
+    spark = SparkSession.getActiveSession()
+    if spark is None:
+        spark = SparkSession.builder.getOrCreate()
+    return spark
+
+
+def _sequence_by_expr(sequence_columns: Sequence[str]) -> Any:
+    from pyspark.sql import functions as F
+
+    if len(sequence_columns) == 1:
+        return F.col(sequence_columns[0])
+    return F.struct(*[F.col(col) for col in sequence_columns])
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+
+def _normalize_scd_type(scd_type: Any, track_history: Any) -> int:
+    if track_history is True and scd_type in (None, "", 1, "1"):
+        scd_type = 2
+    text = str(scd_type).strip().lower().replace(" ", "").replace("-", "").replace("_", "")
+    text = text.replace("type", "").replace("scd", "")
+    if text in {"1", "scd1"}:
+        return 1
+    if text in {"2", "scd2"}:
+        return 2
+    raise ValueError(
+        f"Invalid scd_type {scd_type!r}. Use 1 / 2 / 'SCD1' / 'SCD2' / 'Type 1' / 'Type 2'."
+    )
+
+
+def _coerce_sequence_columns(value: Any) -> List[str]:
+    if isinstance(value, str):
+        return [_ident(value, "sequence_column")]
+    if isinstance(value, Sequence):
+        cols = _ident_list(value, "sequence_column")
+        if not cols:
+            raise ValueError("sequence_column must not be empty.")
+        return cols
+    raise ValueError("sequence_column must be a column name or a list of column names.")
+
+
+def _default_except_columns(
+    except_column_list: Any, operation_column: Optional[str]
+) -> Optional[List[str]]:
+    if except_column_list is not None:
+        return _ident_list(except_column_list, "except_column_list")
+    if operation_column:
+        return [operation_column]
+    return None
+
+
+def _default_delete_sql(operation_column: str, delete_values: Sequence[str]) -> str:
+    seen: set[str] = set()
+    literals: list[str] = []
+    for value in delete_values:
+        token = value.upper().replace("'", "''")
+        if token in seen:
+            continue
+        seen.add(token)
+        literals.append(f"'{token}'")
+    return f"upper(cast(`{operation_column}` AS STRING)) IN ({', '.join(literals)})"
+
+
+def _split_object_name(name: str, *, field: str) -> tuple[Optional[str], Optional[str], str]:
+    parts = [part.strip() for part in name.split(".") if part.strip()]
+    if not parts or len(parts) > 3:
+        raise ValueError(f"{field} must be table or catalog.schema.table, got {name!r}.")
+    if len(parts) == 1:
+        return None, None, parts[0]
+    if len(parts) == 2:
+        return None, parts[0], parts[1]
+    return parts[0], parts[1], parts[2]
+
+
+def _ident(name: str, field: str) -> str:
+    cleaned = name.strip().strip("`")
+    if not _IDENT_RE.fullmatch(cleaned):
+        raise ValueError(f"{field} must be a simple SQL identifier, got {name!r}.")
+    return cleaned
+
+
+def _ident_list(value: Any, field: str) -> List[str]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, Iterable) or isinstance(value, (bytes, bytearray)):
+        raise ValueError(f"{field} must be a list of identifiers.")
+    return [_ident(str(item), field) for item in value]
+
+
+def _optional_ident_list(value: Any, field: str) -> Optional[List[str]]:
+    if value in (None, "", []):
+        return None
+    return _ident_list(value, field)
+
+
+def _string_list(value: Any, field: str) -> List[str]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, Iterable) or isinstance(value, (bytes, bytearray)):
+        raise ValueError(f"{field} must be a list of strings.")
+    items = [str(item).strip() for item in value if str(item).strip()]
+    if not items:
+        raise ValueError(f"{field} must not be empty.")
+    return items
+
+
+def _optional_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    return bool(value)
+
+
+def _first_present(colset: Mapping[str, str], candidates: Sequence[str]) -> Optional[str]:
+    for name in candidates:
+        if name and name.lower() in colset:
+            return colset[name.lower()]
+    return None
+
+
+def _safe_ident(name: str) -> str:
+    ident = re.sub(r"[^0-9A-Za-z_]", "_", name)
+    if not ident or ident[0].isdigit():
+        ident = f"t_{ident}"
+    return ident

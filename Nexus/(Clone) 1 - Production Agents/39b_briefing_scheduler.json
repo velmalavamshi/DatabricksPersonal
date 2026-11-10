@@ -1,0 +1,58 @@
+{
+  "_instructions": [
+    "HOW TO DEPLOY THIS JOB:",
+    "Option A - CLI: databricks jobs create --json @39b_briefing_scheduler.json",
+    "Option B - UI: Workflows > Create Job > JSON tab > paste this file",
+    "Option C - Use scheduleAsset tool from Genie Code"
+  ],
+  "name": "NEXUS - Morning Briefing Agent (Daily 07:00 UTC)",
+  "description": "Runs Agent 39 daily at 07:00 UTC. Queries job statuses, cost, ADO tasks. Delivers briefing to Teams + Email. Publishes to nexus_agent_events.",
+  "tags": {
+    "project": "nexus",
+    "agent": "39_morning_briefing_agent",
+    "workspace": "W1"
+  },
+  "schedule": {
+    "quartz_cron_expression": "0 0 7 * * ?",
+    "timezone_id": "UTC",
+    "pause_status": "PAUSED"
+  },
+  "tasks": [
+    {
+      "task_key": "morning_briefing",
+      "description": "Run the morning briefing agent",
+      "notebook_task": {
+        "notebook_path": "/Users/sameet.patel@hologic.com/5 - Personal Projects/5 - AI Multi Agents/1 - Production Agents/39_morning_briefing_agent",
+        "source": "WORKSPACE"
+      },
+      "environment_key": "Default",
+      "timeout_seconds": 600,
+      "max_retries": 1,
+      "min_retry_interval_millis": 60000,
+      "retry_on_timeout": false
+    }
+  ],
+  "environments": [
+    {
+      "environment_key": "Default",
+      "spec": {
+        "client": "1",
+        "dependencies": ["requests"]
+      }
+    }
+  ],
+  "max_concurrent_runs": 1,
+  "format": "MULTI_TASK",
+  "queue": {
+    "enabled": true
+  },
+  "health": {
+    "rules": [
+      {
+        "metric": "RUN_DURATION_SECONDS",
+        "op": "GREATER_THAN",
+        "value": 600
+      }
+    ]
+  }
+}

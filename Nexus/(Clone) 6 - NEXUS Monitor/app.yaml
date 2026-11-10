@@ -1,0 +1,13 @@
+command:
+  - python
+  - app.py
+
+env:
+  - name: DATABRICKS_WAREHOUSE_ID
+    value: "9f6fb545dba4f67b"
+
+permissions:
+  - user_name: sameet.patel@hologic.com
+    level: CAN_MANAGE
+  - user_name: stone.teele@hologic.com
+    level: CAN_USE
